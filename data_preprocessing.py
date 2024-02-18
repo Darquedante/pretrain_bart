@@ -73,3 +73,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+#python data_preprocessing.py --data your_dataset_path_or_name --use_hf_dataset (if using Hugging Face datasets)
