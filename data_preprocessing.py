@@ -1,72 +1,75 @@
-import argparse
-import random
-import sys
+# Full source code for data_preprocessing.py with enhancements and dataset integration
 
-import numpy as np
-import nlp2
-from datasets import load_dataset, tqdm
+import argparse
+import logging
+import random
+import re
+import sys
 from itertools import groupby
 
+import numpy as np
+from datasets import load_dataset, DatasetDict
 from transformers import AutoTokenizer
 
-
 def parse_args(args):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, required=True, help="train data")
-    parser.add_argument("--tokenizer_config", type=str, default="facebook/mbart-large-50-one-to-many-mmt")
-    parser.add_argument("--output_name", type=str, default="bart_pretrain_data")
-    parser.add_argument("--mask_prob", default=0.15, type=float, help="mask lm probability")
-    parser.add_argument("--worker", default=10, type=int, help="multi processing worker")
-    parser.add_argument("--poisson_lam", default=3, type=int, help="poisson lambda")
-    input_arg, others_arg = parser.parse_known_args(args)
-    input_arg = {k: v for k, v in vars(input_arg).items() if v is not None}
-    others_arg = {
-        k.replace("--", ""): v for k, v in zip(others_arg[:-1:2], others_arg[1::2])
-    }
-    return input_arg, others_arg
+    parser = argparse.ArgumentParser(description="Preprocess data for BART language model training with masking and shuffling.")
+    parser.add_argument("--data", type=str, help="Path to the training data file or dataset name from Hugging Face datasets (if --use_hf_dataset is set).")
+    parser.add_argument("--tokenizer_config", type=str, default="facebook/mbart-large-50-one-to-many-mmt", help="Tokenizer configuration for preprocessing.")
+    parser.add_argument("--output_name", type=str, default="bart_pretrain_data", help="Base name for output files.")
+    parser.add_argument("--mask_prob", type=float, default=0.15, help="Probability of masking a token.")
+    parser.add_argument("--worker", type=int, default=10, help="Number of workers for parallel processing.")
+    parser.add_argument("--poisson_lam", type=int, default=3, help="Lambda for Poisson distribution in masking.")
+    parser.add_argument("--use_hf_dataset", action="store_true", help="Flag to use dataset from Hugging Face datasets instead of a local file.")
+    return parser.parse_args(args)
 
+def split_sentences(text):
+    sentences = re.split(r'(?<=[.!?。]) +', text)
+    return sentences
 
-def main(arg=None):
-    input_arg, others_arg = (
-        parse_args(sys.argv[1:]) if arg is None else parse_args(arg)
+def shuffle_and_mask(sentences, mask_token, mask_prob, poisson_lam):
+    random.shuffle(sentences)
+    masked_sentences = []
+    for sentence in sentences:
+        words = sentence.split()
+        for i, word in enumerate(words):
+            if random.random() < mask_prob:
+                length = np.random.poisson(lam=poisson_lam)
+                mask_sequence = [mask_token] * max(1, length)
+                words[i:i+1] = mask_sequence
+        masked_sentences.append(" ".join(words))
+    return " ".join(masked_sentences)
+
+def preprocess_function(examples, tokenizer, mask_prob, poisson_lam):
+    mask_token = tokenizer.mask_token
+    processed_examples = {'input_text': [], 'target_text': []}
+    for doc in examples["text"]:
+        sentences = split_sentences(doc)
+        input_text = shuffle_and_mask(sentences, mask_token, mask_prob, poisson_lam)
+        processed_examples['input_text'].append(input_text)
+        processed_examples['target_text'].append(doc)
+    return processed_examples
+
+def main():
+    args = parse_args(sys.argv[1:])
+    logging.basicConfig(level=logging.INFO)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_config)
+
+    if args.use_hf_dataset:
+        logging.info(f"Loading dataset from Hugging Face datasets: {args.data}")
+        dataset = load_dataset(args.data)
+    else:
+        logging.info(f"Loading dataset from local file: {args.data}")
+        dataset = load_dataset("text", data_files={'train': args.data})
+
+    processed_dataset = dataset.map(
+        lambda examples: preprocess_function(examples, tokenizer, args.mask_prob, args.poisson_lam),
+        batched=True,
+        num_proc=args.worker
     )
-    tokenizer = AutoTokenizer.from_pretrained(input_arg['tokenizer_config'])
-    MASKTOK = tokenizer.mask_token
-    dataset = load_dataset("text", data_files={'data': input_arg['data']})
 
-    def noisy(examples):
-        try:
-            target_sent = examples['text']
-            sent = examples['text'].split(".")
-            random.shuffle(sent)
-            input_sent = ".".join(sent)
-
-            sent = input_sent.split("。")
-            random.shuffle(sent)
-            input_sent = "。".join(sent)
-
-            input_sent = nlp2.split_sentence_to_array(input_sent)
-            for ind, word in enumerate(input_sent):
-                prob = random.random()
-                if prob <= input_arg['mask_prob'] and len(word) > 0:
-                    length = np.random.poisson(lam=input_arg['poisson_lam'])
-                    if length == 0:
-                        input_sent.insert(ind, MASKTOK)
-                    else:
-                        input_sent[ind:ind + length] = [MASKTOK] * len(input_sent[ind:ind + length])
-            input_sent = [k for k, _ in groupby(input_sent)]  # merge_repeat
-            input_sent = nlp2.join_words_to_sentence(input_sent)
-            examples['input_sent'] = input_sent
-            examples['target_sent'] = target_sent
-        except:
-            pass
-        return examples
-
-    dataset = dataset.map(noisy, num_proc=input_arg['worker'])
-    dataset.save_to_disk(input_arg['output_name'] + "_cache")
-    dataset['data'].to_csv(f'{input_arg["output_name"]}_bart.csv', columns=['input_sent', 'target_sent'], header=False,
-                           index=False)
-
+    output_path = args.output_name + "_cache"
+    logging.info(f"Saving processed dataset to {output_path}...")
+    processed_dataset.save_to_disk(output_path)
 
 if __name__ == "__main__":
     main()
